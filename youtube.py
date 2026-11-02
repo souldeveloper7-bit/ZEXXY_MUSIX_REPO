@@ -3,12 +3,14 @@ import asyncio
 import aiohttp
 from youtube_search import YoutubeSearch
 
+# --- PRIMARY API (Nexor) ---
 NEXOR_STREAM_URL = os.environ.get("NEXOR_STREAM_URL", "https://nexor-yt-pannl.lovable.app")
 NEXOR_STREAM_KEY = os.environ.get("NEXOR_STREAM_KEY", "NEXOR_3481fsghsh62ghs")
 
-# API ko gaana taiyaar karne me time lagta hai — 3 minute tak wait karte hain.
-DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "180"))
+# --- FALLBACK API (Yuki API - backup ke liye) ---
+YUKI_API_URL = "https://yuki-api.onrender.com/download/ytmp3"
 
+DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "180"))
 
 
 async def search_youtube(query: str):
@@ -65,37 +67,52 @@ def _video_id(video: str) -> str:
 
 async def get_stream_url(video: str) -> str:
     """
-    Nexor stream API se seedha streaming url banata hai:
-    https://nexor-yt-pannl.lovable.app/stream/<video_id>?key=<NEXOR_STREAM_KEY>
-
-    Yeh API audio seedha stream karta hai (koi redirect/json nahi, seedha
-    audio/mpeg response), isliye humein file download karke rakhne ki zaroorat
-    nahi — yahi URL seedha AudioPiped ko de dete hain aur ffmpeg khud
-    progressively stream kar leta hai. Bas ek baar connect karke confirm kar
-    lete hain ki video id valid hai aur API jawab de raha hai (bina poora
-    body padhe), warna DownloadError.
+    Pehle Nexor API try karega. Agar wahan 502/Error aaya, toh 
+    automatically Yuki API (Fallback) se link nikalega.
     """
     video_id = _video_id(video)
     if not video_id:
         raise DownloadError("Video id nahi mila")
 
-    stream_url = f"{NEXOR_STREAM_URL}/stream/{video_id}?key={NEXOR_STREAM_KEY}"
+    # ==========================================
+    # 1. TRY PRIMARY API (Nexor)
+    # ==========================================
+    nexor_url = f"{NEXOR_STREAM_URL}/stream/{video_id}?key={NEXOR_STREAM_KEY}"
     timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT, sock_connect=30)
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(stream_url) as resp:
-                if resp.status != 200:
-                    raise DownloadError(f"API ne unexpected response diya: {resp.status}")
-                # Sirf itna confirm karna tha ki stream mil raha hai — poora
-                # audio yahan download nahi karna, isliye body padhe bina hi
-                # `async with` connection close kar dega.
-    except asyncio.TimeoutError:
-        raise DownloadError("Stream API timeout — thodi der baad try karo")
-    except aiohttp.ClientError as e:
-        raise DownloadError(f"API tak pahunch nahi paaye: {e}")
+            async with session.get(nexor_url) as resp:
+                if resp.status == 200:
+                    return nexor_url # Agar Nexor theek hai toh seedha return kar do
+                else:
+                    print(f"[WARNING] Nexor API ne status {resp.status} diya. Fallback par ja rahe hain...")
+    except Exception as e:
+        print(f"[WARNING] Nexor API fail hui: {e}. Fallback par ja rahe hain...")
 
-    return stream_url
+
+    # ==========================================
+    # 2. FALLBACK API (Yuki) - Agar Nexor down hai
+    # ==========================================
+    try:
+        print(f"[INFO] Fallback API se stream nikal rahe hain: {video_id}")
+        fallback_url = f"{YUKI_API_URL}?url=https://youtu.be/{video_id}"
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(fallback_url) as resp:
+                if resp.status != 200:
+                    raise DownloadError(f"Fallback API ne bhi error diya: {resp.status}")
+                
+                data = await resp.json()
+                # Yuki API ka response check karein
+                if data.get("status") and data.get("download_url"):
+                    return data["download_url"]
+                else:
+                    raise DownloadError("Fallback API se valid link nahi mila")
+
+    except Exception as e:
+        # Agar dono API fail ho jayein toh error raise karein
+        raise DownloadError(f"Dono API fail ho gayi. Last error: {e}")
 
 
 async def get_related_track(title: str, exclude_id: str = None):
