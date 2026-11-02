@@ -1,101 +1,94 @@
-import os
-import asyncio
 import aiohttp
-from youtube_search import YoutubeSearch
+from urllib.parse import quote
 
-# --- PRIMARY API (Nexor) ---
-NEXOR_STREAM_URL = os.environ.get("NEXOR_STREAM_URL", "https://nexor-yt-pannl.lovable.app")
-NEXOR_STREAM_KEY = os.environ.get("NEXOR_STREAM_KEY", "NEXOR_3481fsghsh62ghs")
-
-# --- NEW FALLBACK API (Paxsenix) ---
-PAXSENIX_API = "https://api.paxsenix.biz.id/dl/ytmp3"
-
-DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "180"))
-
-async def search_youtube(query: str):
-    loop = asyncio.get_event_loop()
-    def _search():
-        results = YoutubeSearch(query, max_results=1).to_dict()
-        return results[0] if results else None
-    return await loop.run_in_executor(None, _search)
-
-async def search_track(query: str):
-    result = await search_youtube(query)
-    if not result:
-        return None
-    thumbnails = result.get("thumbnails") or []
-    video_id = result.get("id")
-    return {
-        "id": video_id,
-        "title": result.get("title", "Unknown"),
-        "duration": result.get("duration", ""),
-        "thumbnail": thumbnails[0] if thumbnails else None,
-        "channel": result.get("channel") or result.get("uploader") or "",
-        "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else None,
-    }
+# Aapki API ka base URL
+API_BASE_URL = "https://jiosavanapiryden.vercel.app/api"
 
 class DownloadError(Exception):
-    pass
+    """Gaana load nahi ho paya."""
 
-def _video_id(video: str) -> str:
-    video = (video or "").strip()
-    if not video: return ""
-    if "youtu.be/" in video: video = video.split("youtu.be/")[1]
-    elif "v=" in video: video = video.split("v=")[1]
-    elif "/shorts/" in video: video = video.split("/shorts/")[1]
-    elif "/embed/" in video: video = video.split("/embed/")[1]
-    for sep in ("?", "&", "/", "#"): video = video.split(sep)[0]
-    return video
+async def search_track(query: str):
+    """
+    Aapki API se search karke pehla result return karta hai.
+    """
+    url = f"{API_BASE_URL}/search/songs"
+    params = {"query": query, "page": 0, "limit": 1}
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=15) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                
+                if not data.get("success"):
+                    return None
+                
+                songs = data.get("data", {}).get("results", [])
+                if not songs:
+                    return None
+                
+                song = songs[0]
+                # Duration ko seconds se format karein (jaise 245 -> "4:05")
+                duration_sec = song.get("duration", 0)
+                duration_str = f"{duration_sec // 60}:{duration_sec % 60:02d}"
+                
+                return {
+                    "id": song.get("id"),
+                    "title": song.get("name", "Unknown"),
+                    "duration": duration_str,
+                    "thumbnail": song.get("image", [{}])[-1].get("url", ""), # Best quality thumbnail
+                    "channel": ", ".join([a.get("name", "") for a in song.get("artists", {}).get("primary", [])]),
+                    "url": f"https://www.jiosaavn.com/song/{song.get('id')}", # Optional
+                }
+    except Exception as e:
+        print(f"Search error: {e}")
+        return None
 
 async def get_stream_url(video: str) -> str:
-    video_id = _video_id(video)
-    if not video_id: raise DownloadError("Video id nahi mila")
-
-    timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT, sock_connect=30)
-
-    # 1. TRY NEXOR API
-    nexor_url = f"{NEXOR_STREAM_URL}/stream/{video_id}?key={NEXOR_STREAM_KEY}"
+    """
+    Aapki API se song ID ke through direct stream URL nikalta hai.
+    """
+    # Agar video variable mein pehle se ID hai
+    song_id = video
+    
+    url = f"{API_BASE_URL}/songs/{song_id}"
+    
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(nexor_url) as resp:
-                if resp.status == 200:
-                    return nexor_url 
-    except Exception:
-        pass # Nexor fail hua, ab fallback chalega
-
-    # 2. TRY PAXSENIX FALLBACK API
-    try:
-        fallback_url = f"{PAXSENIX_API}?url=https://youtu.be/{video_id}"
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(fallback_url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    # Paxsenix ka response format check karna
-                    if data.get("status") and data.get("result", {}).get("url"):
-                        return data["result"]["url"]
-    except Exception:
-        pass
-
-    raise DownloadError("Dono API fail ho gayi.")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=30) as resp:
+                if resp.status != 200:
+                    raise DownloadError(f"API Error: {resp.status}")
+                
+                data = await resp.json()
+                
+                if not data.get("success") or not data.get("data"):
+                    raise DownloadError("API response mein song data nahi mila")
+                
+                song_info = data["data"][0]
+                download_links = song_info.get("downloadUrl", [])
+                
+                if not download_links:
+                    raise DownloadError("API response mein download link nahi mila")
+                
+                # Sabse best quality (320kbps) aakhri element mein hoti hai
+                best_quality_url = download_links[-1].get("url")
+                
+                if not best_quality_url:
+                    raise DownloadError("Download URL nahi mila")
+                
+                return best_quality_url
+                
+    except Exception as e:
+        raise DownloadError(f"Stream URL fetch error: {e}")
 
 async def get_related_track(title: str, exclude_id: str = None):
-    loop = asyncio.get_event_loop()
-    base = (title or "").split("|")[0].split("(")[0].strip()
-    if not base: return None
-    def _search():
-        try: return YoutubeSearch(f"{base} song", max_results=8).to_dict()
-        except: return []
-    results = await loop.run_in_executor(None, _search)
-    for result in results or []:
-        video_id = result.get("id")
-        if not video_id or video_id == exclude_id: continue
-        thumbnails = result.get("thumbnails") or []
-        return {
-            "id": video_id,
-            "title": result.get("title", "Unknown"),
-            "duration": result.get("duration", ""),
-            "thumbnail": thumbnails[0] if thumbnails else None,
-            "channel": result.get("channel") or result.get("uploader") or "",
-            "url": f"https://www.youtube.com/watch?v={video_id}",
-        }
+    """
+    Autoplay ke liye related track dhoondta hai.
+    (Filhaal isko simple rakha hai, aap chaahein toh ise improve kar sakte hain)
+    """
+    # Simple logic: same title se search karein aur pehla different result lein
+    result = await search_track(title)
+    if result and result.get("id") != exclude_id:
+        return result
     return None
